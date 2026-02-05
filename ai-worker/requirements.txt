@@ -2,5 +2,5 @@ pika
 librosa
 soundfile
 numpy
-qdrant-client
+qdrant-client==1.7.0
 prometheus-client
