@@ -9,6 +9,12 @@ from pyannote.audio import Pipeline
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+from prometheus_client import start_http_server, Summary, Counter, Gauge
+
+REQUEST_TIME = Summary('process_processing_seconds', 'Time spent processing audio')
+jobs_processed = Counter('jobs_processed_total', 'Total number of jobs processed')
+jobs_failed = Counter('jobs_failed_total', 'Total number of failed jobs')
+gpu_utilization = Gauge('gpu_utilization', 'Current GPU Memory Usage (MB)')
 
 try:
     from torch.serialization import add_safe_globals
@@ -17,7 +23,7 @@ try:
     add_safe_globals([TorchVersion, Specifications, Problem, Resolution])
     print("🔓 PyTorch 2.6 Genişletilmiş Güvenlik Yaması Uygulandı.", flush=True)
 except Exception as e:
-    print(f"⚠️ Yama uygulanırken hata (Eski sürüm veya eksik modül): {e}", flush=True)
+    print(f"⚠️ Yama uygulanırken hata: {e}", flush=True)
 
 print("🤖 Modeller yükleniyor (GPU Modu)...", flush=True)
 
@@ -78,6 +84,15 @@ while True:
 
 print(' [*] Worker Hazır! İş bekleniyor...', flush=True)
 
+start_http_server(8000)
+print("📊 Metrics server started on port 8000", flush=True)
+
+def update_gpu_metrics():
+    """GPU bellek kullanımını günceller"""
+    if torch.cuda.is_available():
+        mem = torch.cuda.memory_allocated(0) / 1024 / 1024 
+        gpu_utilization.set(mem)
+
 def format_diarization(diarization_result):
     output = []
     for turn, _, speaker in diarization_result.itertracks(yield_label=True):
@@ -87,10 +102,8 @@ def format_diarization(diarization_result):
     return " | ".join(output)
 
 def save_to_memory(text, summary, speakers, file_path):
-    """Veriyi vektöre çevirip Qdrant'a kaydeder."""
     try:
         embedding = embedder.encode(summary).tolist()
-        
         point_id = str(uuid.uuid4())
         q_client.upsert(
             collection_name=COLLECTION_NAME,
@@ -112,6 +125,49 @@ def save_to_memory(text, summary, speakers, file_path):
     except Exception as e:
         print(f"⚠️ Hafıza Kayıt Hatası: {e}", flush=True)
 
+@REQUEST_TIME.time() 
+def process_audio_job(file_path):
+    update_gpu_metrics()
+    
+    print(f"🎤 Ses işleniyor: {file_path}", flush=True)
+    
+    result = transcriber(
+        file_path, 
+        return_timestamps=True, 
+        generate_kwargs={"language": "english", "task": "transcribe"}
+    )
+    text = result["text"]
+    print(f"📝 Transkript: {text}", flush=True)
+    
+    speakers_log = "Devre dışı"
+    if diarization_pipeline:
+        try:
+            print("🗣️ Konuşmacılar analiz ediliyor...", flush=True)
+            diarization = diarization_pipeline(file_path)
+            speakers_log = format_diarization(diarization)
+            print(f"👥 Konuşmacılar: {speakers_log}", flush=True)
+        except Exception as d_error:
+            print(f"⚠️ Diarization sırasında hata: {d_error}", flush=True)
+    
+    word_count = len(text.split())
+    if word_count > 30: 
+        summary = summarizer(
+            text, 
+            max_length=100,  
+            min_length=30,    
+            do_sample=False,
+            repetition_penalty=2.0,
+            truncation=True
+        )
+        final_summary = summary[0]['summary_text']
+    else:
+        final_summary = text
+        print("ℹ️ Metin kısa olduğu için özetleme atlandı.", flush=True)
+
+    print(f"💡 Özet: {final_summary}", flush=True)
+
+    save_to_memory(text, final_summary, speakers_log, file_path)
+
 def callback(ch, method, properties, body):
     try:
         job = json.loads(body)
@@ -120,53 +176,18 @@ def callback(ch, method, properties, body):
         file_path = job['file_path']
         
         if os.path.exists(file_path):
-            print(f"🎤 Ses işleniyor: {file_path}", flush=True)
+            process_audio_job(file_path)
             
-            result = transcriber(
-                file_path, 
-                return_timestamps=True, 
-                generate_kwargs={
-                    "language": "english", 
-                    "task": "transcribe"
-                }
-            )
-            text = result["text"]
-            print(f"📝 Transkript: {text}", flush=True)
-            
-            speakers_log = "Devre dışı"
-            if diarization_pipeline:
-                try:
-                    print("🗣️ Konuşmacılar analiz ediliyor...", flush=True)
-                    diarization = diarization_pipeline(file_path)
-                    speakers_log = format_diarization(diarization)
-                    print(f"👥 Konuşmacılar: {speakers_log}", flush=True)
-                except Exception as d_error:
-                    print(f"⚠️ Diarization sırasında hata: {d_error}", flush=True)
-            
-            word_count = len(text.split())
-            if word_count > 30: 
-                summary = summarizer(
-                    text, 
-                    max_length=100,  
-                    min_length=30,    
-                    do_sample=False,
-                    repetition_penalty=2.0,
-                    truncation=True
-                )
-                final_summary = summary[0]['summary_text']
-            else:
-                final_summary = text
-                print("ℹ️ Metin kısa olduğu için özetleme atlandı.", flush=True)
-
-            print(f"💡 Özet: {final_summary}", flush=True)
-
-            save_to_memory(text, final_summary, speakers_log, file_path)
+            jobs_processed.inc()
+            print("✅ Görev Başarıyla Tamamlandı", flush=True)
             
         else:
             print(f"❌ Dosya bulunamadı: {file_path}", flush=True)
+            jobs_failed.inc()
 
     except Exception as e:
         print(f"❌ İşlem sırasında genel hata: {e}", flush=True)
+        jobs_failed.inc()
 
     ch.basic_ack(delivery_tag=method.delivery_tag)
 

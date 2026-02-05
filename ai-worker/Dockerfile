@@ -1,8 +1,6 @@
-FROM python:3.9-slim
+FROM pw-ai-base:v1
 
 WORKDIR /app
-
-RUN apt-get update && apt-get install -y ffmpeg git
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

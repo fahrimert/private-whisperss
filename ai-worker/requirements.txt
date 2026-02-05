@@ -1,10 +1,6 @@
-torch
-transformers
 pika
 librosa
 soundfile
 numpy
-accelerate
-pyannote.audio
-sentence-transformers
 qdrant-client
+prometheus-client

@@ -43,6 +43,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+    ports:
+      - "8000:8000" 
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - PYTHONUNBUFFERED=1
@@ -55,3 +57,22 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+  prometheus:
+    image: prom/prometheus
+    container_name: pw-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  grafana:
+    image: grafana/grafana
+    container_name: pw-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
