@@ -5,3 +5,4 @@ librosa
 soundfile
 numpy
 accelerate
+pyannote.audio
