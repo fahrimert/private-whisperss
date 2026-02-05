@@ -17,3 +17,4 @@ hf_cache/
 backend/uploads/*
 !backend/uploads/.gitkeep
 .env
+qdrant_data

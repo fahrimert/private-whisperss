@@ -3,17 +3,18 @@ import os
 import time
 import json
 import torch
+import uuid 
 from transformers import pipeline
 from pyannote.audio import Pipeline
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
 
 try:
     from torch.serialization import add_safe_globals
     from torch.torch_version import TorchVersion
-    
     from pyannote.audio.core.task import Specifications, Problem, Resolution
-    
     add_safe_globals([TorchVersion, Specifications, Problem, Resolution])
-    
     print("🔓 PyTorch 2.6 Genişletilmiş Güvenlik Yaması Uygulandı.", flush=True)
 except Exception as e:
     print(f"⚠️ Yama uygulanırken hata (Eski sürüm veya eksik modül): {e}", flush=True)
@@ -24,8 +25,8 @@ device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
 device_id = 0 if torch.cuda.is_available() else -1
 
 transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-small", device=device_id)
-
 summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-6-6", device=device_id)
+embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 diarization_pipeline = None
@@ -45,6 +46,22 @@ except Exception as e:
     print(f"⚠️ Diarization modeli yüklenirken hata: {e}", flush=True)
 
 print("✅ Tüm Modeller Hazır!", flush=True)
+
+qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
+q_client = QdrantClient(host=qdrant_host, port=6333)
+COLLECTION_NAME = "audio_memory"
+
+try:
+    if not q_client.collection_exists(COLLECTION_NAME):
+        q_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=qmodels.VectorParams(size=384, distance=qmodels.Distance.COSINE),
+        )
+        print(f"🧠 Hafıza (Collection) oluşturuldu: {COLLECTION_NAME}", flush=True)
+    else:
+        print(f"🧠 Hafıza (Collection) bulundu: {COLLECTION_NAME}", flush=True)
+except Exception as e:
+    print(f"⚠️ Qdrant Bağlantı Hatası: {e}", flush=True)
 
 rabbit_url = os.environ.get('RABBITMQ_URL', 'amqp://guest:guest@rabbitmq:5672/')
 params = pika.URLParameters(rabbit_url)
@@ -69,6 +86,32 @@ def format_diarization(diarization_result):
         output.append(f"[{start}s - {end}s] {speaker}")
     return " | ".join(output)
 
+def save_to_memory(text, summary, speakers, file_path):
+    """Veriyi vektöre çevirip Qdrant'a kaydeder."""
+    try:
+        embedding = embedder.encode(summary).tolist()
+        
+        point_id = str(uuid.uuid4())
+        q_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                qmodels.PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload={
+                        "file_path": file_path,
+                        "full_text": text,
+                        "summary": summary,
+                        "speakers": speakers,
+                        "processed_at": time.time()
+                    }
+                )
+            ]
+        )
+        print("🧠 Hafızaya Kaydedildi!", flush=True)
+    except Exception as e:
+        print(f"⚠️ Hafıza Kayıt Hatası: {e}", flush=True)
+
 def callback(ch, method, properties, body):
     try:
         job = json.loads(body)
@@ -90,7 +133,7 @@ def callback(ch, method, properties, body):
             text = result["text"]
             print(f"📝 Transkript: {text}", flush=True)
             
-            speakers_log = "Devre dışı (Token yok veya hata)"
+            speakers_log = "Devre dışı"
             if diarization_pipeline:
                 try:
                     print("🗣️ Konuşmacılar analiz ediliyor...", flush=True)
@@ -116,6 +159,8 @@ def callback(ch, method, properties, body):
                 print("ℹ️ Metin kısa olduğu için özetleme atlandı.", flush=True)
 
             print(f"💡 Özet: {final_summary}", flush=True)
+
+            save_to_memory(text, final_summary, speakers_log, file_path)
             
         else:
             print(f"❌ Dosya bulunamadı: {file_path}", flush=True)

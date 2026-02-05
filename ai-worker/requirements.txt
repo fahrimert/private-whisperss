@@ -6,3 +6,5 @@ soundfile
 numpy
 accelerate
 pyannote.audio
+sentence-transformers
+qdrant-client

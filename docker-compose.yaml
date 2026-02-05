@@ -12,7 +12,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
+  qdrant:
+    image: qdrant/qdrant
+    container_name: pw-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant_data:/qdrant/storage
   api:
     build: ./backend
     container_name: pw-api
@@ -35,10 +41,13 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - PYTHONUNBUFFERED=1
       - HF_TOKEN=${HF_TOKEN}
+      - QDRANT_HOST=qdrant
     deploy:
       resources:
         reservations:
