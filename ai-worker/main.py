@@ -11,6 +11,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from prometheus_client import start_http_server, Summary, Counter, Gauge
 
+from audio_features import analyze_stress
+
 REQUEST_TIME = Summary('process_processing_seconds', 'Time spent processing audio')
 jobs_processed = Counter('jobs_processed_total', 'Total number of jobs processed')
 jobs_failed = Counter('jobs_failed_total', 'Total number of failed jobs')
@@ -88,7 +90,6 @@ start_http_server(8000)
 print("📊 Metrics server started on port 8000", flush=True)
 
 def update_gpu_metrics():
-    """GPU bellek kullanımını günceller"""
     if torch.cuda.is_available():
         mem = torch.cuda.memory_allocated(0) / 1024 / 1024 
         gpu_utilization.set(mem)
@@ -101,9 +102,11 @@ def format_diarization(diarization_result):
         output.append(f"[{start}s - {end}s] {speaker}")
     return " | ".join(output)
 
-def save_to_memory(text, summary, speakers, file_path):
+def save_to_memory(text, summary, speakers, file_path, stress_score=0):
     try:
-        embedding = embedder.encode(summary).tolist()
+        print("🧠 Vektör oluşturuluyor (Full Text)...", flush=True)
+        embedding = embedder.encode(text).tolist() 
+        
         point_id = str(uuid.uuid4())
         q_client.upsert(
             collection_name=COLLECTION_NAME,
@@ -113,8 +116,10 @@ def save_to_memory(text, summary, speakers, file_path):
                     vector=embedding,
                     payload={
                         "file_path": file_path,
-                        "full_text": text,
-                        "summary": summary,
+                        "summary": text, 
+                        "text": text,
+                        "full_text": text, 
+                        "stress_score": stress_score,
                         "speakers": speakers,
                         "processed_at": time.time()
                     }
@@ -139,6 +144,15 @@ def process_audio_job(file_path):
     text = result["text"]
     print(f"📝 Transkript: {text}", flush=True)
     
+    # --- 2. SES TONU VE STRES ANALİZİ (YENİ) ---
+    print("📉 Ses Tonu Analiz Ediliyor (Biometrik Veri)...", flush=True)
+    stress_score, audio_details = analyze_stress(file_path)
+    print(f"📊 Stres Skoru: {stress_score}/100 ({audio_details['analysis']})", flush=True)
+    
+    # Llama 3'ün bu stresi görebilmesi için metnin sonuna ekliyoruz!
+    ai_context_note = f"\n\n[SYSTEM ANALYSIS]: Audio Biometrics indicate a Stress Score of {stress_score}/100. Details: {audio_details}"
+    final_text_for_ai = text + ai_context_note
+
     speakers_log = "Devre dışı"
     if diarization_pipeline:
         try:
@@ -149,6 +163,7 @@ def process_audio_job(file_path):
         except Exception as d_error:
             print(f"⚠️ Diarization sırasında hata: {d_error}", flush=True)
     
+    # Özetleme kısmı (Artık sadece loglarda görünmesi için var, API'ye full text gidecek)
     word_count = len(text.split())
     if word_count > 30: 
         summary = summarizer(
@@ -164,9 +179,10 @@ def process_audio_job(file_path):
         final_summary = text
         print("ℹ️ Metin kısa olduğu için özetleme atlandı.", flush=True)
 
-    print(f"💡 Özet: {final_summary}", flush=True)
+    print(f"💡 Özet (Log): {final_summary}", flush=True)
 
-    save_to_memory(text, final_summary, speakers_log, file_path)
+    # Kaydederken 'final_text_for_ai' kullanıyoruz ki Llama 3 stres notunu görsün
+    save_to_memory(final_text_for_ai, final_summary, speakers_log, file_path, stress_score)
 
 def callback(ch, method, properties, body):
     try:

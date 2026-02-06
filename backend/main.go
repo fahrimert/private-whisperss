@@ -15,8 +15,8 @@ import (
 )
 
 var (
-	OllamaURL = "http://ollama:11434"
-	QdrantURL = os.Getenv("QDRANT_URL") 
+	OllamaURL = "http://pw-ollama:11434" 
+	QdrantURL = os.Getenv("QDRANT_URL")
 )
 
 

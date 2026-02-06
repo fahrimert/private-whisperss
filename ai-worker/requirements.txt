@@ -4,3 +4,4 @@ soundfile
 numpy
 qdrant-client==1.7.0
 prometheus-client
+scipy
