@@ -1,140 +1,224 @@
 import streamlit as st
 import requests
-import io
-from audiorecorder import audiorecorder
 import time
+import os
+import io # EKLENDİ: Ses verisini işlemek için
+
+# EKLENDİ: Mikrofon kütüphanesi kontrolü
+try:
+    from audiorecorder import audiorecorder
+except ImportError:
+    st.warning("Mikrofon özelliği için kütüphane eksik. Terminalde şunu çalıştırın: pip install streamlit-audiorecorder")
+    audiorecorder = None
 
 # Sayfa Ayarları
 st.set_page_config(page_title="AI Dedektif Paneli", page_icon="🕵️‍♂️", layout="wide")
 
-API_URL = "http://api:8080" # Backend Adresi
+# Backend URL'i (Docker içinden veya localden çalışması için)
+API_URL = os.getenv("API_URL", "http://api:8080")
 
-# CSS: Metrikleri büyüt
+# --- CSS İle Özelleştirme ---
 st.markdown("""
-<style>
-    div[data-testid="stMetricValue"] { font-size: 24px; }
-    .stProgress > div > div > div > div { background-color: #f63366; }
-</style>
-""", unsafe_allow_html=True)
+    <style>
+    .stApp {
+        background-color: #0e1117;
+    }
+    .stMetric {
+        background-color: #262730;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #41444e;
+    }
+    .big-font {
+        font-size:24px !important;
+        font-weight: bold;
+    }
+    .success-box {
+        padding: 15px;
+        border-radius: 10px;
+        background-color: rgba(33, 195, 84, 0.1);
+        border: 1px solid #21c354;
+    }
+    .chat-row {
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
+# Başlık
 st.title("🕵️‍♂️ AI Dedektif Paneli: Biyometrik Analiz")
 st.markdown("---")
 
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = None
-
-# --- YAN PANEL ---
+# --- YAN MENÜ (GÜNCELLENDİ: MİKROFON EKLENDİ) ---
 with st.sidebar:
     st.header("🔍 Kanıt Topla")
-    input_method = st.radio("Yöntem:", ["Dosya Yükle 📂", "Mikrofon 🎤"])
     
-    file_to_upload = None
+    # Kullanıcıya seçim sunuyoruz
+    input_method = st.radio("Yöntem Seçin:", ["Dosya Yükle 📂", "Mikrofon Kullan 🎤"])
+    
+    files_to_send = None
 
+    # 1. DOSYA YÜKLEME SEÇENEĞİ
     if input_method == "Dosya Yükle 📂":
         uploaded_file = st.file_uploader("Ses Dosyası (MP3/WAV)", type=["mp3", "wav"])
-        if uploaded_file:
-            file_to_upload = {"file": (uploaded_file.name, uploaded_file, "audio/mpeg")}
+        if uploaded_file is not None:
+            files_to_send = {"file": uploaded_file}
 
-    elif input_method == "Mikrofon 🎤":
-        st.info("Kayıt al ve analize gönder.")
-        audio = audiorecorder("Kaydı Başlat", "Durdur")
-        if len(audio) > 0:
-            st.audio(audio.export().read())
-            audio_bytes = io.BytesIO()
-            audio.export(audio_bytes, format="wav")
-            audio_bytes.seek(0)
-            file_to_upload = {"file": ("mic_recording.wav", audio_bytes, "audio/wav")}
-
-    if file_to_upload and st.button("Analizi Başlat 🚀", type="primary"):
-        with st.spinner("Dosya Backend'e gönderiliyor..."):
-            try:
-                # 1. Dosyayı Yükle
-                response = requests.post(f"{API_URL}/upload", files=file_to_upload)
+    # 2. MİKROFON SEÇENEĞİ (YENİ EKLENDİ)
+    elif input_method == "Mikrofon Kullan 🎤":
+        if audiorecorder:
+            st.info("Kaydı başlatmak için butona basın, konuşun ve durdurun.")
+            audio = audiorecorder("Kaydı Başlat", "Kaydı Durdur")
+            
+            if len(audio) > 0:
+                # Kaydı oynatıcıda göster
+                st.audio(audio.export().read())
                 
-                if response.status_code == 200:
-                    data = response.json()
-                    file_id = data.get("file_id")
-                    st.success("✅ Dosya Kuyruğa Alındı! Worker bekleniyor...")
+                # Sesi byte formatına çevirip dosya gibi hazırla
+                audio_bytes = io.BytesIO()
+                audio.export(audio_bytes, format="wav")
+                audio_bytes.seek(0)
+                
+                # Backend'e 'mic_recording.wav' adıyla gönderilecek
+                files_to_send = {"file": ("mic_recording.wav", audio_bytes, "audio/wav")}
+        else:
+            st.error("Mikrofon kütüphanesi (audiorecorder) yüklü değil.")
+
+    # ORTAK GÖNDERME BUTONU
+    if files_to_send is not None:
+        if st.button("Analizi Başlat 🚀", type="primary"):
+            with st.spinner("Dosya Backend'e yükleniyor..."):
+                try:
+                    # Seçilen dosyayı (veya mikrofon kaydını) gönder
+                    response = requests.post(f"{API_URL}/upload", files=files_to_send)
                     
-                    # 2. Polling (Sürekli sorma)
-                    progress_text = "Analiz ediliyor..."
-                    my_bar = st.progress(0, text=progress_text)
-                    
-                    for percent_complete in range(100):
-                        time.sleep(1) # 1 saniye bekle
-                        my_bar.progress(percent_complete + 1, text=f"{progress_text} ({percent_complete}sn)")
+                    if response.status_code == 200:
+                        data = response.json()
+                        job_id = data.get("job_id") # job_id'yi al
+                        st.session_state['job_id'] = job_id
+                        st.session_state['status'] = 'processing'
+                        # Yeni analizde önceki sonuçları temizle
+                        if 'result' in st.session_state: del st.session_state['result']
+                        if 'messages' in st.session_state: st.session_state['messages'] = []
                         
-                        # Backend'e sor: Bitti mi?
-                        try:
-                            status_res = requests.get(f"{API_URL}/status/{file_id}")
-                            if status_res.status_code == 200:
-                                res_json = status_res.json()
-                                if res_json.get("status") == "completed":
-                                    st.session_state.analysis_result = res_json
-                                    my_bar.progress(100, text="Analiz Tamamlandı!")
-                                    st.success("Sonuçlar Hazır!")
-                                    break
-                        except:
-                            pass
+                        st.success(f"✅ Dosya Kuyruğa Alındı! ID: {job_id}")
+                        st.rerun() # Sayfayı yenile ve işlem moduna geç
                     else:
-                        st.error("Zaman aşımı! Worker cevap vermedi.")
+                        st.error(f"Yükleme hatası: {response.text}")
+                except Exception as e:
+                    st.error(f"Bağlantı hatası: {e}")
+
+# --- ANA EKRAN MANTIĞI ---
+
+# 1. İşlem Durumunu Kontrol Et
+if 'job_id' in st.session_state and st.session_state.get('status') == 'processing':
+    job_id = st.session_state['job_id']
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    # Polling (Sürekli sorma) Döngüsü
+    for i in range(100):
+        try:
+            # Backend'e sor: Bitti mi?
+            check = requests.get(f"{API_URL}/status/{job_id}")
+            
+            if check.status_code == 200:
+                result = check.json()
+                
+                if result["status"] == "completed":
+                    progress_bar.progress(100)
+                    status_text.success("Analiz Tamamlandı!")
+                    st.session_state['result'] = result # Sonucu kaydet
+                    st.session_state['status'] = 'completed'
+                    st.rerun() # Sayfayı yenile
+                    break
                 else:
-                    st.error(f"Hata: {response.text}")
-            except Exception as e:
-                st.error(f"Bağlantı Hatası: {e}")
+                    status_text.info(f"Analiz ediliyor... (Backend: {result.get('status', 'bilinmiyor')})")
+            else:
+                status_text.warning("Worker bekleniyor...")
+                
+        except Exception as e:
+            status_text.error(f"Bağlantı hatası: {e}")
+            
+        time.sleep(2) # 2 saniye bekle
+        progress_bar.progress(min(i + 5, 95))
 
-# --- ANA EKRAN (GÖSTERGELER) ---
-if st.session_state.analysis_result:
-    data = st.session_state.analysis_result
-    # Eğer Qdrant'tan gelen veri string ise parse etmeye gerek olabilir, 
-    # ama Go kodunda map[string]interface gönderdik, JSON olarak gelir.
-    details = data.get("stress_details", {})
-    score = data.get("stress_score", 0)
-    transcript = data.get("transcript", "")
-
+# 2. Sonuçları Göster
+if st.session_state.get('status') == 'completed' and 'result' in st.session_state:
+    res = st.session_state['result']
+    
+    # Renkli Stres Kartı
+    stress_score = res.get('stress_score', 0)
+    details = res.get('stress_details', {})
+    
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        # Renkli Skor
-        color = "green"
-        if score > 60: color = "red"
-        elif score > 30: color = "orange"
+        color = "red" if stress_score > 50 else "green"
+        level = "High Stress" if stress_score > 50 else "Calm"
         
         st.markdown(f"""
-            <div style="text-align: center; border: 4px solid {color}; padding: 20px; border-radius: 15px;">
-                <h3 style="color: {color}; margin:0;">STRES SKORU</h3>
-                <h1 style="font-size: 80px; color: {color}; margin:0;">{int(score)}</h1>
-                <h4 style="color: gray;">{details.get('analysis', 'Unknown')}</h4>
-            </div>
+        <div style="border: 2px solid {color}; border-radius: 10px; padding: 20px; text-align: center;">
+            <h3 style="color: {color}; margin:0;">STRES SKORU</h3>
+            <h1 style="font-size: 80px; color: {color}; margin:0;">{int(stress_score)}</h1>
+            <h3 style="color: {color}; margin:0;">{level}</h3>
+        </div>
         """, unsafe_allow_html=True)
-
+        
     with col2:
         st.subheader("📝 Transkript")
-        st.info(f'"{transcript}"')
-        if details.get("reasons"):
-            st.warning(f"🚨 Tespitler: {details.get('reasons')}")
+        st.info(res.get('transcript', 'Metin yok...'))
+        
+        # Tespitler
+        if 'reasons' in details:
+            st.warning(f"🚨 **Tespitler:** {details['reasons']}")
 
-    st.markdown("### 📊 Biyometrik Sinyaller")
-    m1, m2, m3 = st.columns(3)
+    st.markdown("---")
     
-    with m1:
-        # Tremor (Titreme)
-        val = float(details.get("tremor_index", 0))
-        pct = min(100, int(val * 200)) # 0.5 -> 100%
-        st.metric("Titreme (Tremor)", f"{val}")
-        st.progress(pct)
+    # Biyometrik Veriler (Metrics)
+    st.subheader("📊 Biyometrik Sinyaller")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Titreme (Tremor)", f"{details.get('tremor_index', 0):.3f}")
+    m2.metric("Ses Kaosu", f"{details.get('chaos_index', 0):.4f}")
+    m3.metric("Hız (BPM)", f"{details.get('tempo', 0):.1f}")
 
-    with m2:
-        # Chaos (Kaos)
-        val = float(details.get("chaos_index", 0))
-        pct = min(100, int(val * 1500)) 
-        st.metric("Ses Kaosu", f"{val}")
-        st.progress(pct)
+    st.markdown("---")
 
-    with m3:
-        # Tempo
-        val = float(details.get("tempo", 0))
-        # 60 BPM = %0, 180 BPM = %100
-        pct = min(100, max(0, int((val - 60) * 0.8)))
-        st.metric("Hız (BPM)", f"{val}")
-        st.progress(pct)
+    # --- 3. CHAT BÖLÜMÜ (MEVCUT KOD) ---
+    st.header("💬 Dedektif ile Sohbet")
+    st.caption("Bu analiz hakkında Llama 3 modeline soru sorabilirsiniz.")
+
+    # Sohbet geçmişini tut
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Geçmiş mesajları ekrana bas
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Kullanıcıdan girdi al
+    if prompt := st.chat_input("Örn: Mike neden bu kadar gergin görünüyor?"):
+        # 1. Kullanıcı mesajını göster
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        # 2. Backend'e sor
+        with st.chat_message("assistant"):
+            with st.spinner("Dedektif düşünüyor..."):
+                try:
+                    payload = {"question": prompt}
+                    # Backend /chat endpoint'ine istek at
+                    chat_response = requests.post(f"{API_URL}/chat", json=payload)
+                    
+                    if chat_response.status_code == 200:
+                        ai_reply = chat_response.json().get("answer", "Cevap yok.")
+                        st.markdown(ai_reply)
+                        st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+                    else:
+                        st.error(f"Hata: {chat_response.text}")
+                except Exception as e:
+                    st.error(f"Bağlantı hatası: {e}")
