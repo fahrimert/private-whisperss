@@ -15,7 +15,35 @@ def analyze_stress(file_path):
         y, sr = librosa.load(file_path)
         duration = librosa.get_duration(y=y, sr=sr)
 
-        # --- 1. ÖZNİTELİK ÇIKARIMI (FEATURE EXTRACTION) ---
+        # --- YENİ EKLENEN KISIM: ZAMAN ÇİZELGESİ (TIMELINE) ---
+        # Grafiği çizmek için saniye saniye enerji ve gerginlik analizi
+        timeline = []
+        total_seconds = int(duration)
+        if total_seconds == 0: total_seconds = 1 # Çok kısa dosyalar için koruma
+
+        for t in range(total_seconds):
+            # Saniyelik parça al (Slicing)
+            start_sample = t * sr
+            end_sample = (t + 1) * sr
+            chunk = y[start_sample:end_sample]
+            
+            if len(chunk) > 0:
+                # O saniyedeki Enerji (RMS) -> Bağırma şiddeti
+                local_rms = np.mean(librosa.feature.rms(y=chunk))
+                # O saniyedeki Tizlik/Sertlik (Zero Crossing Rate) -> Heyecan
+                local_zcr = np.mean(librosa.feature.zero_crossing_rate(chunk))
+                
+                # Basit bir anlık stres formülü (Normalize edilmemiş ham değerlerden skor üretme)
+                # RMS genelde 0.0-0.1 arası, ZCR 0.0-0.2 arasıdır. Katsayılarla 0-100'e çekiyoruz.
+                momentary_stress = (local_rms * 400) + (local_zcr * 150)
+                
+                # 0-100 arasına sıkıştır ve listeye ekle
+                timeline.append(min(100, max(0, momentary_stress)))
+            else:
+                timeline.append(0)
+        # -------------------------------------------------------
+
+        # --- 1. ÖZNİTELİK ÇIKARIMI (MEVCUT KOD) ---
         
         # A. Pitch (F0) Analizi
         f0, voiced_flag, voiced_probs = librosa.pyin(
@@ -27,9 +55,6 @@ def analyze_stress(file_path):
         rms = librosa.feature.rms(y=y)[0]
         
         # C. Spektral Düzlük (Spectral Flatness)
-        # Bu değer sesin ne kadar "Gürültüye/Kaosa" benzediğini ölçer.
-        # Sakin ses = Düşük Flatness (Tonlu)
-        # Çığlık/Panik/Hışırtı = Yüksek Flatness (Kaotik)
         flatness = librosa.feature.spectral_flatness(y=y)[0]
         
         # D. Tempo
@@ -39,14 +64,10 @@ def analyze_stress(file_path):
 
         # --- 2. İSTATİSTİKSEL HESAPLAMALAR (EVRENSEL) ---
         
-        # Eğer ses çok kısaysa veya sessizse varsayılan değerler
         if len(f0_clean) == 0:
-            return 0, {"error": "No voice detected"}
+            return 0, {"error": "No voice detected", "timeline": []}
 
-        # Varyasyon Katsayısı (CV) -> Standart Sapma / Ortalama
-        # Bu oran, sesin perdesinden (ince/kalın) bağımsız olarak "Titreme"yi verir.
-        # CV < 0.15: Çok stabil (Spiker gibi)
-        # CV > 0.35: Çok kararsız (Ağlama, Korku)
+        # Varyasyon Katsayısı (CV)
         pitch_cv = variation(f0_clean)
         
         # Enerji Değişkenliği
@@ -56,29 +77,20 @@ def analyze_stress(file_path):
         mean_flatness = np.mean(flatness)
 
         # --- 3. SKORLAMA (NORMALİZASYON) ---
-        # Burada "if > 140" yok. İnsan konuşma limitlerine göre 0-100 arası puanlıyoruz.
         
-        # A. Stabilite Skoru (Ses ne kadar titriyor?)
-        # İnsan sesi genelde 0.1 ile 0.5 arası CV üretir.
+        # A. Stabilite Skoru
         score_instability = normalize_feature(pitch_cv, 0.15, 0.45)
         
-        # B. Enerji Skoru (Ses ne kadar patlayıcı?)
-        # Enerji CV genelde 0.3 ile 1.5 arasındadır.
+        # B. Enerji Skoru
         score_energy_var = normalize_feature(energy_cv, 0.4, 1.2)
         
-        # C. Kaos Skoru (Ses ne kadar bozuk/yırtık?)
-        # Çığlık atınca bu değer tavan yapar.
+        # C. Kaos Skoru
         score_chaos = normalize_feature(mean_flatness, 0.01, 0.06)
         
         # D. Tempo Skoru
-        # 90 BPM altı sakin, 160 BPM üstü panik kabul edilir (Lineer artış)
         score_tempo = normalize_feature(avg_tempo, 90, 160)
 
         # --- 4. AĞIRLIKLI ORTALAMA ---
-        # Stres tek bir şey değildir. Hepsinin birleşimidir.
-        
-        # Titreme ve Kaos en büyük stres belirtisidir (%70 etki)
-        # Hız ve Enerji değişimi yardımcı faktördür (%30 etki)
         
         final_score = (
             (score_instability * 0.40) +  # En önemli: Ses titremesi
@@ -87,7 +99,7 @@ def analyze_stress(file_path):
             (score_energy_var * 0.15)     # Yan etken: Enerji dalgalanması
         )
         
-        # Sebepleri belirle (En yüksek puanı verenler)
+        # Sebepleri belirle
         reasons = []
         if score_instability > 60: reasons.append("High Tremor")
         if score_chaos > 60: reasons.append("Harsh/Chaotic Voice")
@@ -101,14 +113,16 @@ def analyze_stress(file_path):
 
         print(f"🔍 DEBUG: Instab={score_instability:.1f}, Chaos={score_chaos:.1f}, TempoScore={score_tempo:.1f}, EnergyScore={score_energy_var:.1f}", flush=True)
 
+        # --- DÖNÜŞ DEĞERİ (GÜNCELLENDİ: TIMELINE EKLENDİ) ---
         return int(final_score), {
             "tremor_index": round(float(pitch_cv), 3),
             "chaos_index": round(float(mean_flatness), 4),
             "tempo": round(float(avg_tempo), 1),
             "reasons": ", ".join(reasons),
-            "analysis": label
+            "analysis": label,
+            "timeline": timeline  # <-- Backend ve Frontend'in kullanacağı grafik verisi
         }
 
     except Exception as e:
         print(f"⚠️ Audio Analiz Hatası: {e}")
-        return 0, {"error": str(e)}
+        return 0, {"error": str(e), "timeline": []}
