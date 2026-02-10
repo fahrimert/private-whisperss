@@ -11,6 +11,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from prometheus_client import start_http_server, Summary, Counter, Gauge
 
+# Senin oluşturduğun evrensel analiz modülü
 from audio_features import analyze_stress
 
 REQUEST_TIME = Summary('process_processing_seconds', 'Time spent processing audio')
@@ -102,36 +103,46 @@ def format_diarization(diarization_result):
         output.append(f"[{start}s - {end}s] {speaker}")
     return " | ".join(output)
 
-def save_to_memory(text, summary, speakers, file_path, stress_score=0):
+# --- DÜZELTME: job_id ve stress_details parametreleri eklendi ---
+def save_to_memory(text, summary, speakers, file_path, stress_score=0, stress_details=None, job_id=None):
     try:
         print("🧠 Vektör oluşturuluyor (Full Text)...", flush=True)
         embedding = embedder.encode(text).tolist() 
         
         point_id = str(uuid.uuid4())
+        
+        # Payload içine job_id ve detayları ekliyoruz
+        payload_data = {
+            "job_id": job_id,  # Backend'in arama yapacağı anahtar
+            "file_path": file_path,
+            "summary": text, 
+            "text": text,
+            "full_text": text, 
+            "stress_score": stress_score,
+            "speakers": speakers,
+            "processed_at": time.time()
+        }
+        
+        if stress_details:
+            payload_data["stress_details"] = stress_details
+
         q_client.upsert(
             collection_name=COLLECTION_NAME,
             points=[
                 qmodels.PointStruct(
                     id=point_id,
                     vector=embedding,
-                    payload={
-                        "file_path": file_path,
-                        "summary": text, 
-                        "text": text,
-                        "full_text": text, 
-                        "stress_score": stress_score,
-                        "speakers": speakers,
-                        "processed_at": time.time()
-                    }
+                    payload=payload_data
                 )
             ]
         )
-        print("🧠 Hafızaya Kaydedildi!", flush=True)
+        print(f"🧠 Hafızaya Kaydedildi! (Job ID: {job_id})", flush=True)
     except Exception as e:
         print(f"⚠️ Hafıza Kayıt Hatası: {e}", flush=True)
 
 @REQUEST_TIME.time() 
-def process_audio_job(file_path):
+# --- DÜZELTME: job_id parametresi eklendi ---
+def process_audio_job(file_path, job_id): 
     update_gpu_metrics()
     
     print(f"🎤 Ses işleniyor: {file_path}", flush=True)
@@ -144,10 +155,13 @@ def process_audio_job(file_path):
     text = result["text"]
     print(f"📝 Transkript: {text}", flush=True)
     
-    # --- 2. SES TONU VE STRES ANALİZİ (YENİ) ---
+    # --- SES TONU VE STRES ANALİZİ ---
     print("📉 Ses Tonu Analiz Ediliyor (Biometrik Veri)...", flush=True)
+    
+    # Analyze stress artık hem skor hem de DETAY dönüyor
     stress_score, audio_details = analyze_stress(file_path)
-    print(f"📊 Stres Skoru: {stress_score}/100 ({audio_details['analysis']})", flush=True)
+    
+    print(f"📊 Stres Skoru: {stress_score}/100 ({audio_details.get('analysis', 'Unknown')})", flush=True)
     
     # Llama 3'ün bu stresi görebilmesi için metnin sonuna ekliyoruz!
     ai_context_note = f"\n\n[SYSTEM ANALYSIS]: Audio Biometrics indicate a Stress Score of {stress_score}/100. Details: {audio_details}"
@@ -163,7 +177,6 @@ def process_audio_job(file_path):
         except Exception as d_error:
             print(f"⚠️ Diarization sırasında hata: {d_error}", flush=True)
     
-    # Özetleme kısmı (Artık sadece loglarda görünmesi için var, API'ye full text gidecek)
     word_count = len(text.split())
     if word_count > 30: 
         summary = summarizer(
@@ -181,18 +194,22 @@ def process_audio_job(file_path):
 
     print(f"💡 Özet (Log): {final_summary}", flush=True)
 
-    # Kaydederken 'final_text_for_ai' kullanıyoruz ki Llama 3 stres notunu görsün
-    save_to_memory(final_text_for_ai, final_summary, speakers_log, file_path, stress_score)
+    # --- DÜZELTME: job_id ve details'i kaydet fonksiyonuna gönderiyoruz ---
+    save_to_memory(final_text_for_ai, final_summary, speakers_log, file_path, stress_score, audio_details, job_id)
 
 def callback(ch, method, properties, body):
     try:
         job = json.loads(body)
-        print(f" [x] Görev Alındı: {job.get('job_id', 'Unknown')}", flush=True)
+        
+        # job_id'yi kuyruktan güvenli bir şekilde al
+        job_id = job.get('job_id', 'Unknown') 
+        print(f" [x] Görev Alındı: {job_id}", flush=True)
         
         file_path = job['file_path']
         
         if os.path.exists(file_path):
-            process_audio_job(file_path)
+            # job_id'yi işleme fonksiyonuna ilet
+            process_audio_job(file_path, job_id) 
             
             jobs_processed.inc()
             print("✅ Görev Başarıyla Tamamlandı", flush=True)

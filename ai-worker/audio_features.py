@@ -1,108 +1,110 @@
 import librosa
 import numpy as np
 import warnings
+from scipy.stats import variation
 
 warnings.filterwarnings("ignore")
 
+def normalize_feature(value, min_val, max_val):
+    """Değeri 0-100 arasına sıkıştırır (Clamping)"""
+    return max(0, min(100, (value - min_val) / (max_val - min_val) * 100))
+
 def analyze_stress(file_path):
     try:
-        # Sesi yükle
+        # Sesi yükle (Mono)
         y, sr = librosa.load(file_path)
+        duration = librosa.get_duration(y=y, sr=sr)
 
-        # --- 1. HAM VERİLERİ ÇIKAR ---
+        # --- 1. ÖZNİTELİK ÇIKARIMI (FEATURE EXTRACTION) ---
         
-        # Pitch (Perde)
+        # A. Pitch (F0) Analizi
         f0, voiced_flag, voiced_probs = librosa.pyin(
             y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7')
         )
         f0_clean = f0[~np.isnan(f0)]
         
-        # Enerji (RMS)
+        # B. Enerji (RMS)
         rms = librosa.feature.rms(y=y)[0]
         
-        # Tempo (Ritim)
+        # C. Spektral Düzlük (Spectral Flatness)
+        # Bu değer sesin ne kadar "Gürültüye/Kaosa" benzediğini ölçer.
+        # Sakin ses = Düşük Flatness (Tonlu)
+        # Çığlık/Panik/Hışırtı = Yüksek Flatness (Kaotik)
+        flatness = librosa.feature.spectral_flatness(y=y)[0]
+        
+        # D. Tempo
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo_dynamic = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr)
-        avg_tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)[0]
+        tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+        avg_tempo = tempo[0] if len(tempo) > 0 else 0
 
-        # --- 2. İSTATİSTİKSEL ANALİZ (Kişiye Özel Normalizasyon) ---
+        # --- 2. İSTATİSTİKSEL HESAPLAMALAR (EVRENSEL) ---
         
-        # Bu kişinin "Normal" ses tonu nedir?
-        mean_pitch = np.mean(f0_clean) if len(f0_clean) > 0 else 0
-        std_pitch = np.std(f0_clean) if len(f0_clean) > 0 else 0
-        
-        # Bu kişinin "Normal" enerji seviyesi nedir?
-        mean_energy = np.mean(rms)
-        std_energy = np.std(rms)
-        
-        # Pitch Değişkenliği (Titreme)
-        pitch_variance = std_pitch  # Standart sapma zaten değişimdir
+        # Eğer ses çok kısaysa veya sessizse varsayılan değerler
+        if len(f0_clean) == 0:
+            return 0, {"error": "No voice detected"}
 
-        # --- 3. DİNAMİK PUANLAMA (Z-Score Mantığı) ---
-        # Burada "Sayılar" değil, "Sapmalar" konuşur.
-        # Bir değer, ortalamadan ne kadar uzak? (Standart Sapma cinsinden)
+        # Varyasyon Katsayısı (CV) -> Standart Sapma / Ortalama
+        # Bu oran, sesin perdesinden (ince/kalın) bağımsız olarak "Titreme"yi verir.
+        # CV < 0.15: Çok stabil (Spiker gibi)
+        # CV > 0.35: Çok kararsız (Ağlama, Korku)
+        pitch_cv = variation(f0_clean)
         
-        score = 0
+        # Enerji Değişkenliği
+        energy_cv = variation(rms)
+        
+        # Ortalama Kaos (Flatness)
+        mean_flatness = np.mean(flatness)
+
+        # --- 3. SKORLAMA (NORMALİZASYON) ---
+        # Burada "if > 140" yok. İnsan konuşma limitlerine göre 0-100 arası puanlıyoruz.
+        
+        # A. Stabilite Skoru (Ses ne kadar titriyor?)
+        # İnsan sesi genelde 0.1 ile 0.5 arası CV üretir.
+        score_instability = normalize_feature(pitch_cv, 0.15, 0.45)
+        
+        # B. Enerji Skoru (Ses ne kadar patlayıcı?)
+        # Enerji CV genelde 0.3 ile 1.5 arasındadır.
+        score_energy_var = normalize_feature(energy_cv, 0.4, 1.2)
+        
+        # C. Kaos Skoru (Ses ne kadar bozuk/yırtık?)
+        # Çığlık atınca bu değer tavan yapar.
+        score_chaos = normalize_feature(mean_flatness, 0.01, 0.06)
+        
+        # D. Tempo Skoru
+        # 90 BPM altı sakin, 160 BPM üstü panik kabul edilir (Lineer artış)
+        score_tempo = normalize_feature(avg_tempo, 90, 160)
+
+        # --- 4. AĞIRLIKLI ORTALAMA ---
+        # Stres tek bir şey değildir. Hepsinin birleşimidir.
+        
+        # Titreme ve Kaos en büyük stres belirtisidir (%70 etki)
+        # Hız ve Enerji değişimi yardımcı faktördür (%30 etki)
+        
+        final_score = (
+            (score_instability * 0.40) +  # En önemli: Ses titremesi
+            (score_chaos * 0.30) +        # Önemli: Sesin bozulması/yırtılması
+            (score_tempo * 0.15) +        # Yan etken: Hız
+            (score_energy_var * 0.15)     # Yan etken: Enerji dalgalanması
+        )
+        
+        # Sebepleri belirle (En yüksek puanı verenler)
         reasons = []
+        if score_instability > 60: reasons.append("High Tremor")
+        if score_chaos > 60: reasons.append("Harsh/Chaotic Voice")
+        if score_tempo > 70: reasons.append("Rapid Speech")
+        if score_energy_var > 70: reasons.append("Explosive Energy")
         
-        # A. PITCH ANALİZİ (Göreceli)
-        # Eğer pitch, ortalamanın %20 üzerindeyse veya standart sapmanın 1.5 katıysa
-        if len(f0_clean) > 0:
-            max_pitch = np.max(f0_clean)
-            # Kişi kendi ortalamasının çok üstüne çıktı mı?
-            if max_pitch > (mean_pitch + (1.5 * std_pitch)):
-                score += 30
-                reasons.append("Sudden Pitch Spike")
-            elif max_pitch > (mean_pitch * 1.2):
-                score += 15
-                reasons.append("Elevated Pitch")
+        if final_score < 25: label = "Calm"
+        elif final_score < 50: label = "Mild Stress"
+        elif final_score < 75: label = "High Stress"
+        else: label = "EXTREME PANIC"
 
-        # B. TİTREME (VARIANCE)
-        # Standart sapma (titreme) çok yüksekse
-        # İnsan sesi genelde 20-30 arası sapar. 40+ güvensizliktir.
-        if std_pitch > 50:
-            score += 30
-            reasons.append("Extreme Voice Tremor")
-        elif std_pitch > 30:
-            score += 15
-            reasons.append("Shaky Voice")
+        print(f"🔍 DEBUG: Instab={score_instability:.1f}, Chaos={score_chaos:.1f}, TempoScore={score_tempo:.1f}, EnergyScore={score_energy_var:.1f}", flush=True)
 
-        # C. TEMPO (HIZ)
-        # 130 BPM evrensel bir panik sınırıdır ama biz yine de dinamik bakalım.
-        if avg_tempo > 140:
-            score += 40
-            reasons.append("Panic Speed")
-        elif avg_tempo > 120:
-            score += 20
-            reasons.append("Fast Pace")
-
-        # D. SESSİZLİK ORANI (Silence Ratio)
-        # Çok fazla duraksamak (kem küm etmek) strestir.
-        non_silent_intervals = librosa.effects.split(y, top_db=20)
-        non_silent_duration = sum(end - start for start, end in non_silent_intervals) / sr
-        total_duration = librosa.get_duration(y=y, sr=sr)
-        silence_ratio = 1 - (non_silent_duration / total_duration)
-
-        if silence_ratio > 0.4: # %40'tan fazla sessizlik/duraksama
-            score += 15
-            reasons.append("Hesitation/Pauses")
-
-        # --- 4. SONUÇ ---
-        final_score = min(100, score)
-        
-        # Etiketleme
-        if final_score > 70: label = "HIGH STRESS"
-        elif final_score > 40: label = "Moderate Stress"
-        elif final_score > 20: label = "Low Stress"
-        else: label = "Calm"
-
-        # Debug için gerçek değerleri de basalım
-        print(f"🔍 DEBUG: MeanPitch={mean_pitch:.1f}, MaxPitch={np.max(f0_clean):.1f}, StdDev={std_pitch:.1f}, Tempo={avg_tempo:.1f}", flush=True)
-
-        return final_score, {
-            "avg_pitch": round(float(mean_pitch), 2),
-            "voice_fluctuation": round(float(std_pitch), 2),
-            "tempo": round(float(avg_tempo), 2),
+        return int(final_score), {
+            "tremor_index": round(float(pitch_cv), 3),
+            "chaos_index": round(float(mean_flatness), 4),
+            "tempo": round(float(avg_tempo), 1),
             "reasons": ", ".join(reasons),
             "analysis": label
         }

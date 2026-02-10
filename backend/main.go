@@ -10,15 +10,15 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/google/uuid"
 	"github.com/streadway/amqp"
 )
 
 var (
-	OllamaURL = "http://pw-ollama:11434" 
+	OllamaURL = "http://pw-ollama:11434"
 	QdrantURL = os.Getenv("QDRANT_URL")
 )
-
 
 type Job struct {
 	ID       string `json:"job_id"`
@@ -38,18 +38,37 @@ type EmbeddingResponse struct {
 	Embedding []float64 `json:"embedding"`
 }
 
+// Qdrant Search Request
 type QdrantSearchRequest struct {
-	Vector      []float64 `json:"vector"`
-	Limit       int       `json:"limit"`
-	WithPayload bool      `json:"with_payload"`
+	Vector      []float64              `json:"vector,omitempty"`
+	Filter      map[string]interface{} `json:"filter,omitempty"`
+	Limit       int                    `json:"limit"`
+	WithPayload bool                   `json:"with_payload"`
 }
-type QdrantSearchResponse struct {
+
+// Qdrant Payload
+type QdrantPayload struct {
+	Summary       string                 `json:"summary"`
+	FilePath      string                 `json:"file_path"`
+	Text          string                 `json:"text"`
+	StressScore   float64                `json:"stress_score"`
+	StressDetails map[string]interface{} `json:"stress_details"`
+}
+
+// --- MEVCUT: Search işlemi için cevap yapısı ---
+type QdrantResponse struct {
 	Result []struct {
-		Score   float64 `json:"score"`
-		Payload struct {
-			Summary  string `json:"summary"`
-			FilePath string `json:"file_path"`
-		} `json:"payload"`
+		Score   float64       `json:"score"`
+		Payload QdrantPayload `json:"payload"`
+	} `json:"result"`
+}
+
+// --- Scroll işlemi için özel cevap yapısı ---
+type QdrantScrollResponse struct {
+	Result struct {
+		Points []struct {
+			Payload QdrantPayload `json:"payload"`
+		} `json:"points"`
 	} `json:"result"`
 }
 
@@ -62,7 +81,17 @@ type GenerateResponse struct {
 	Response string `json:"response"`
 }
 
+type StatusResponse struct {
+	Status        string                 `json:"status"`
+	StressScore   float64                `json:"stress_score"`
+	StressDetails map[string]interface{} `json:"stress_details"`
+	Transcript    string                 `json:"transcript"`
+}
+
 func main() {
+	// 1. LOG AYARLARI (HATAYI GÖRMEK İÇİN)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	if QdrantURL == "" {
 		QdrantURL = "http://qdrant:6333"
 	}
@@ -77,10 +106,10 @@ func main() {
 	for i := 0; i < 10; i++ {
 		conn, err = amqp.Dial(rabbitURL)
 		if err == nil {
-			fmt.Println("✅ RabbitMQ'ya bağlanıldı!")
+			log.Println("✅ RabbitMQ'ya bağlanıldı!")
 			break
 		}
-		fmt.Printf("⏳ RabbitMQ bekleniyor (%d/10)...\n", i+1)
+		log.Printf("⏳ RabbitMQ bekleniyor (%d/10)...\n", i+1)
 		time.Sleep(2 * time.Second)
 	}
 	if err != nil {
@@ -91,13 +120,14 @@ func main() {
 	ch, _ := conn.Channel()
 	defer ch.Close()
 
-	q, _ := ch.QueueDeclare(
-		"task_queue",
-		true,
-		false, false, false, nil,
-	)
+	q, _ := ch.QueueDeclare("task_queue", true, false, false, false, nil)
 
 	app := fiber.New()
+
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept",
+	}))
 
 	os.Mkdir("./uploads", 0755)
 
@@ -117,24 +147,84 @@ func main() {
 		job := Job{ID: id, FilePath: filePath, Status: "queued"}
 		body, _ := json.Marshal(job)
 
-		err = ch.Publish(
-			"",
-			q.Name,
-			false, false,
-			amqp.Publishing{
-				ContentType: "application/json",
-				Body:        body,
-			})
+		err = ch.Publish("", q.Name, false, false, amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		})
 
 		if err != nil {
 			return c.Status(500).SendString("Kuyruğa atılamadı")
 		}
 
-		fmt.Printf("📨 Görev Kuyruğa Atıldı: %s\n", id)
+		log.Printf("📨 UPLOAD: Görev Kuyruğa Atıldı. ID: %s\n", id)
+		
 		return c.JSON(fiber.Map{
-			"status":  "accepted",
+			"status":  "processing_started",
+			"file_id": id,
 			"job_id":  id,
 			"message": "Dosya işlenmek üzere sıraya alındı.",
+		})
+	})
+
+	// --- STATUS ENDPOINT (LOGLU) ---
+	app.Get("/status/:id", func(c *fiber.Ctx) error {
+		jobID := c.Params("id")
+		
+		// Log: İstek geldi mi?
+		log.Printf("🔍 STATUS SORGUSU: %s aranıyor...\n", jobID)
+
+		searchPayload := QdrantSearchRequest{
+			Filter: map[string]interface{}{
+				"must": []map[string]interface{}{
+					{
+						"key": "job_id",
+						"match": map[string]interface{}{
+							"value": jobID,
+						},
+					},
+				},
+			},
+			Limit:       1,
+			WithPayload: true,
+		}
+
+		jsonData, _ := json.Marshal(searchPayload)
+		resp, err := http.Post(QdrantURL+"/collections/audio_memory/points/scroll", "application/json", bytes.NewBuffer(jsonData))
+		
+		if err != nil {
+			log.Printf("⚠️ Qdrant Bağlantı Hatası: %v\n", err)
+			return c.JSON(fiber.Map{"status": "pending"})
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			log.Printf("⚠️ Qdrant Status Code: %d\n", resp.StatusCode)
+			return c.JSON(fiber.Map{"status": "pending"})
+		}
+
+		// Scroll için doğru struct'ı kullanıyoruz
+		var result QdrantScrollResponse 
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			log.Printf("⚠️ JSON Decode Hatası: %v\n", err)
+			return c.JSON(fiber.Map{"status": "pending"})
+		}
+
+		// Sonuç var mı kontrolü
+		pointCount := len(result.Result.Points)
+		if pointCount == 0 {
+			log.Printf("⏳ Henüz sonuç yok (Worker çalışıyor)... ID: %s\n", jobID)
+			return c.JSON(fiber.Map{"status": "pending"})
+		}
+
+		// KAYIT BULUNDU!
+		payload := result.Result.Points[0].Payload
+		log.Printf("✅ SONUÇ BULUNDU! Skor: %.2f - ID: %s\n", payload.StressScore, jobID)
+		
+		return c.JSON(StatusResponse{
+			Status:        "completed",
+			StressScore:   payload.StressScore,
+			StressDetails: payload.StressDetails,
+			Transcript:    payload.Text,
 		})
 	})
 
@@ -144,7 +234,7 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Geçersiz istek gövdesi"})
 		}
 
-		fmt.Printf("🔎 Soru Geldi: %s\n", req.Question)
+		log.Printf("🔎 Chat Sorusu: %s\n", req.Question)
 
 		vector, err := getEmbedding(req.Question)
 		if err != nil {
@@ -157,16 +247,16 @@ func main() {
 		}
 
 		prompt := fmt.Sprintf(`
-		You are a helpful AI assistant. Use the following CONTEXT (summaries of audio files) to answer the QUESTION.
-		If the answer is not in the context, say "I don't have enough information."
-		
-		CONTEXT:
-		%s
-		
-		QUESTION: 
-		%s
-		
-		ANSWER:`, contextText, req.Question)
+        You are a helpful AI assistant. Use the following CONTEXT (summaries of audio files) to answer the QUESTION.
+        If the answer is not in the context, say "I don't have enough information."
+        
+        CONTEXT:
+        %s
+        
+        QUESTION: 
+        %s
+        
+        ANSWER:`, contextText, req.Question)
 
 		answer, err := generateResponse(prompt)
 		if err != nil {
@@ -179,13 +269,13 @@ func main() {
 		})
 	})
 
+	log.Println("🚀 Backend 8080 portunda başlatılıyor...")
 	log.Fatal(app.Listen(":8080"))
 }
 
-
 func getEmbedding(text string) ([]float64, error) {
 	payload := EmbeddingRequest{
-		Model:  "all-minilm", 
+		Model:  "all-minilm",
 		Prompt: text,
 	}
 	jsonData, _ := json.Marshal(payload)
@@ -222,7 +312,8 @@ func searchQdrant(vector []float64) (string, []string, error) {
 		return "", nil, fmt.Errorf("qdrant status: %d", resp.StatusCode)
 	}
 
-	var result QdrantSearchResponse
+	// Search işlemi için eski struct (QdrantResponse) doğru çalışıyor
+	var result QdrantResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", nil, err
 	}
