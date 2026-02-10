@@ -7,11 +7,14 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    networks:
+      - ai-network
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+
   qdrant:
     image: qdrant/qdrant
     container_name: pw-qdrant
@@ -19,6 +22,9 @@ services:
       - "6333:6333"
     volumes:
       - ./qdrant_data:/qdrant/storage
+    networks:
+      - ai-network
+
   api:
     build: ./backend
     container_name: pw-api
@@ -29,6 +35,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+    networks:
+      - ai-network
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
 
@@ -45,6 +53,8 @@ services:
         condition: service_started
     ports:
       - "8000:8000" 
+    networks:
+      - ai-network
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - PYTHONUNBUFFERED=1
@@ -66,6 +76,8 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
+    networks:
+      - ai-network
 
   grafana:
     image: grafana/grafana
@@ -76,6 +88,9 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     depends_on:
       - prometheus
+    networks:
+      - ai-network
+  
   ollama:
     image: ollama/ollama:latest
     container_name: pw-ollama
@@ -93,3 +108,20 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    networks:
+      - ai-network
+  ai-frontend:
+    build: ./ai-frontend
+    container_name: pw-frontend
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    networks:
+      - ai-network
+    environment:
+      - API_URL=http://api:8080
+
+networks:
+  ai-network:
+    driver: bridge
